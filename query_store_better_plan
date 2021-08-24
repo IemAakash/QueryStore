@@ -1,0 +1,178 @@
+begin try
+set nocount on;
+/********************************declare variables and set values**************************************/
+declare @unprocessed int = 1;
+declare @dbid int;
+declare @dbname varchar(50);
+declare @dsql nvarchar(max);
+declare @paramdefinition nvarchar(max);
+declare @ts_now bigint = (select cpu_ticks/(cpu_ticks/ms_ticks) from sys.dm_os_sys_info with (nolock)) 
+/**variables requiring user input**/
+declare @cpu_threshold smallint =65; /*kickoff the script when average cpu is above threshold */
+declare @cpu_high_minutes tinyint = 15;  /*kickoff the script when cpu is above threshold for these many minutes*/
+declare @prmcpusavingperc tinyint=15; /* this variable value will be used to narrow queries/plans with potential of cpu saving in percentage */
+declare @prmsumofcpusavingseconds int=900; /*this variable value will be used to narrow queries/plans with potential of cpu saving in seconds*/
+
+/***********************check if average cpu is more than threshold for past xx minutes********************************/
+if ((select  avg(sqlprocessutilization) as [avg_cpu_sql]
+	 from (select record.value('(./Record/@id)[1]', 'int') as record_id, 
+			record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'int') 
+            as [sqlprocessutilization], [timestamp] 
+			from (select [timestamp], convert(xml, record) as [record] 
+				  from sys.dm_os_ring_buffers with (nolock)
+				  where ring_buffer_type = N'ring_buffer_scheduler_monitor' 
+				 and record like N'%<SystemHealth>%') as x) as y 
+			where dateadd(ms, -1 * (@ts_now - [timestamp]), getdate()) > dateadd(minute,-@cpu_high_minutes,getdate())
+     )>@cpu_threshold)
+begin
+/********************************define the temp tables****************************************************/
+		if object_id('tempdb.dbo.#queries_having_poor_plan', 'u') is null
+			create table #queries_having_poor_plan
+			( [database] varchar(50),
+			query_id int,
+			current_plan_id int,
+			executions int,
+			better_plan_id int,
+			prv_executions int,
+			current_cpu_avg_micro int,
+			prior_cpu_avg_micro int,
+			avg_cpu_saving_seconds float(24),
+			cpu_saving_percentage tinyint,
+			est_total_saving_sec float(24)
+			);
+		if object_id('tempdb.dbo.#qsdb', 'u') is null
+			create table #qsdb
+			([rowid] smallint identity (1,1),
+			[dbid] int,
+			[processed] bit 
+			);
+		truncate table #qsdb;
+		truncate table #queries_having_poor_plan;
+
+/***********************find out databases hosting high cpu process*************************************************/
+            insert into #qsdb
+            (
+                dbid,
+                processed
+            )
+            select top 25 
+			exectext.dbid,
+			0 as [processed]
+            from sys.dm_exec_query_stats deqs
+            cross apply  sys.dm_exec_sql_text(deqs.plan_handle) as exectext
+                    cross apply     sys.dm_exec_query_plan(deqs.plan_handle) as queryplan
+                    where                   deqs.execution_count > 2                                   /** executed at least two times **/
+                    and                     deqs.last_execution_time > dateadd(minute,-30,getdate())   /** last execution was in the last 30 minutes or still running **/
+                    and                     (                                                          /** since we may have a new plan or the old plan is no longer good we need to check two things here:**/
+                                            (deqs.last_elapsed_time > deqs.min_elapsed_time * 1.5)     /** last execution time is greater than 150% min execution time **/
+                                            or (deqs.creation_time > dateadd(minute,-60,getdate()))    /** or plan was created in the last 60 mins **/
+                                            )
+            order by convert(decimal(38, 2), (convert(float, total_worker_time) / execution_count) / 1000) desc; /** by avg cpu time **/
+
+/****************************loop through each database from #qsdb**********************************************************/
+            if((select count(*) from #qsdb inner join sys.databases db on dbid=db.database_id where #qsdb.dbid between 5 and 32766 and db.is_query_store_on=1) > 0)
+			begin
+				while(@unprocessed > 0)
+				begin 
+					set @dbid = (select top 1 dbid from #qsdb inner join sys.databases db on dbid=db.database_id where processed = 0 and dbid between 5 and 32766 and db.is_query_store_on=1)
+					if(@dbid is not null)
+						begin
+							update #qsdb
+							set processed = 1
+							where dbid = @dbid;
+							set @unprocessed = @@rowcount;
+							set @dbname = (select db_name(@dbid));
+						end
+					else
+							goto prepare_message;
+
+/************************************start scanning query store dmvs for each database**************************************************/
+							set @dsql = 'use ['+@dbname+']
+							if exists(select 1 from sys.database_query_store_options(nolock) where actual_state = 2) /** make sure database is on primary node by checking QS state **/
+								begin
+									print ''begining scanning database '' + db_name() + '' QS DMVs at '' + (convert( varchar(24), getdate(), 121));
+									;with query_store_results as
+									(
+									select qsp.query_id [query_id],
+									qsp.plan_id [current_plan_id],
+									qsrs.count_executions[executions],
+									history.plan_id [better_plan_id],
+									history.count_executions[prv_executions],
+									cast(qsrs.avg_cpu_time as bigint) [current_cpu_avg_micro],
+									cast(history.avg_cpu_time as bigint) [prior_cpu_avg_micro],
+									cast((qsrs.avg_cpu_time - history.avg_cpu_time) as float)/cast(1000000 as float) as [avg_cpu_saving_seconds],
+									cast((((qsrs.avg_cpu_time - history.avg_cpu_time) * 100) / qsrs.avg_cpu_time) as tinyint) as [cpu_saving_percentage],
+									row_number() over (partition by qsp.query_id order by qsp.last_execution_time desc) as [rank]
+									from sys.query_store_plan(nolock) qsp
+									inner join sys.query_store_runtime_stats qsrs (nolock) on qsp.plan_id = qsrs.plan_id
+									inner join sys.query_store_runtime_stats_interval qsrsi (nolock) on qsrs.runtime_stats_interval_id = qsrsi.runtime_stats_interval_id
+									inner join sys.query_store_query qsq(nolock) on qsp.query_id = qsq.query_id
+									inner join sys.query_store_query_text qsqt(nolock) on qsq.query_text_id = qsqt.query_text_id
+									inner join (
+													select qsp2.query_id, qsp2.plan_id, qsrs2.avg_cpu_time, qsrs2.count_executions,
+													row_number() over (partition by qsp2.query_id, qsp2.plan_id order by qsrs2.avg_cpu_time) as rownum
+													from sys.query_store_plan(nolock) qsp2
+													inner join sys.query_store_runtime_stats qsrs2 (nolock) on qsp2.plan_id = qsrs2.plan_id
+													inner join sys.query_store_runtime_stats_interval qsrsi2 (nolock) on qsrs2.runtime_stats_interval_id = qsrsi2.runtime_stats_interval_id
+													inner join sys.query_store_query qsq2 (nolock) on qsp2.query_id = qsq2.query_id
+													inner join sys.query_store_query_text qsqt2 (nolock) on qsq2.query_text_id = qsqt2.query_text_id
+													where  1=1
+													and qsp2.last_execution_time > dateadd(hour, -96, sysutcdatetime()) /**old plan used in last 4 days**/
+													and qsrs2.count_executions > 5 /** old plan executed at least 5 times in last 4 days**/
+									) as history 
+									on qsp.query_id = history.query_id
+									where qsp.last_execution_time > dateadd(minute, -45, sysutcdatetime()) /** current plan is executed/executing in last 45 minutes **/
+									and qsrsi.start_time > dateadd(minute,-120,sysutcdatetime()) 
+									and qsp.plan_id != history.plan_id 
+									and (((qsrs.avg_cpu_time - history.avg_cpu_time) * 100) / qsrs.avg_cpu_time) > @cpu_saving_perc  /** other plan is at least xx% better interms of cpu **/
+									and ((qsrs.avg_cpu_time - history.avg_cpu_time)*qsrs.count_executions) > (@cpu_saving_seconds*1000000) /** estimated total cpu saving of at least xx seconds **/
+									and history.rownum = 1
+									and qsrs.count_executions > 1  /** at least one successful execution before consideration. **/
+									)
+									insert into #queries_having_poor_plan 
+									([database]
+									,query_id
+									,current_plan_id
+									,executions
+									,better_plan_id
+									,prv_executions
+									,current_cpu_avg_micro
+									,prior_cpu_avg_micro
+									,avg_cpu_saving_seconds
+									,cpu_saving_percentage
+									,est_total_saving_sec)
+									select db_name() as [database]
+									,query_id
+									,current_plan_id
+									,executions
+									,better_plan_id
+									,prv_executions
+									,current_cpu_avg_micro
+									,prior_cpu_avg_micro
+									,avg_cpu_saving_seconds
+									,cpu_saving_percentage
+									,(avg_cpu_saving_seconds*executions) as est_total_saving_sec
+									from query_store_results
+									where [rank] = 1;
+								end'
+								set @paramdefinition = N'@cpu_saving_perc tinyint, @cpu_saving_seconds int'
+								execute sys.sp_executesql @dsql, 
+														@paramdefinition,
+														@cpu_saving_perc=@prmcpusavingperc,
+														@cpu_saving_seconds=@prmsumofcpusavingseconds
+								print 'finished scanning database ' + @dbname + ' at ' + (convert( varchar(24), getdate(), 121));
+								set @dbid = null
+				end
+			end
+prepare_message:
+           select * from #queries_having_poor_plan
+           order by est_total_saving_sec desc;
+end
+end try
+/** error handling **/
+begin catch
+   /** insert your standard error handling **/
+end catch
+go
+
+
