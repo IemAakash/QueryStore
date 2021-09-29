@@ -1,8 +1,10 @@
 /**DISCLAIMER: 
 This script is designed to help SQL Server users. 
 It may not be suitable to run on your servers, please take necessary precautions and approvals from your organization to use this. 
-You will be responsible for any performance impacts on your server, or any other consequence for this script. 
+You will be responsible for any performance impacts on your server, or any other consequence for using this script. 
 It is an open-source script shared under MIT License 
+Author : Aakash Patel
+Initial Release: 09/22/2021
 **/
 
 begin try
